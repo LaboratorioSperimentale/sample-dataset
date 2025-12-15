@@ -1,5 +1,5 @@
 import sys
-from typing import Iterable, Tuple, Hashable, Optional, Sequence, List, Dict, Any
+from typing import Optional, Sequence, List, Dict
 
 import pandas as pd
 import numpy as np
@@ -11,6 +11,8 @@ def assign_buckets_multiple(
     df_minima: pd.DataFrame,
     n_samples: int,
     key_cols: Optional[Sequence[str]] = None,
+    constraint_on_rows: Optional[Sequence[str]] = None,
+    constraint_on_buckets: Optional[Sequence[str]] = None,
     min_required_col: str = "min_required",
     time_limit: Optional[float] = 240.0,
     base_seed: Optional[int] = None,
@@ -23,7 +25,7 @@ def assign_buckets_multiple(
     Returns a single DataFrame with an extra column 'sample_id' indicating
     which run each row comes from.
     """
-# Start from a clean copy of the original data
+
     out = df.copy().reset_index(drop=True)
 
     for k in range(n_samples):
@@ -33,26 +35,30 @@ def assign_buckets_multiple(
             df=df,
             df_minima=df_minima,
             key_cols=key_cols,
+            constraint_on_rows=constraint_on_rows,
+            constraint_on_buckets=constraint_on_buckets,
             min_required_col=min_required_col,
             time_limit=time_limit,
             random_seed=seed,
             verbose=verbose,
         )
 
-        # df_k is a copy with a 'bucket' column; we only need that column
-        out[f"bucket_{k}"] = df_k["bucket"].values
+        out[f"assignment_{k}"] = df_k["bucket"].values
 
     return out
+
 
 def assign_buckets(
     df: pd.DataFrame,
     df_minima: pd.DataFrame,
     key_cols: Optional[Sequence[str]] = None,
+    constraint_on_rows: Optional[Sequence[str]] = None,
+    constraint_on_buckets: Optional[Sequence[str]] = None,
     min_required_col: str = "min_required",
     time_limit: Optional[float] = 240.0,
     random_seed: Optional[int] = None,
     verbose: bool = True,
-) -> pd.DataFrame:
+    ) -> pd.DataFrame:
     """
     Assign rows of `df` to buckets defined in `df_minima` via constraint optimization.
 
@@ -127,6 +133,14 @@ def assign_buckets(
         if col not in df_minima.columns:
             raise ValueError(f"Column '{col}' from key_cols not found in df_minima")
 
+    if constraint_on_rows is not None:
+        constraint_on_rows = list(constraint_on_rows)
+        for col in constraint_on_rows:
+            if col not in df.columns:
+                raise ValueError(f"Column '{col}' from constraint_on_rows not found in df")
+    else:
+        constraint_on_rows = []
+
     # Work on copies with clean integer indexes
     df = df.copy().reset_index(drop=True)
     df_minima = df_minima.copy().reset_index(drop=True)
@@ -171,14 +185,81 @@ def assign_buckets(
                 y[(i, b)] = model.NewConstant(0)
 
         if not any_match:
-            raise ValueError(
-                f"Row {i} (values {df.loc[i, key_cols].to_dict()}) "
-                "does not match any bucket in df_minima based on key_cols."
-            )
+            sys.stderr.write(f"Row {i} (values {df.loc[i, key_cols].to_dict()}) "
+                            "does not match any bucket in df_minima based on key_cols.")
 
-    # Each row goes to exactly one bucket
+            # raise ValueError(
+                # f"Row {i} (values {df.loc[i, key_cols].to_dict()}) "
+                # "does not match any bucket in df_minima based on key_cols."
+            # )
+
+    # Each row goes to at most one bucket
     for i in indices:
-        model.Add(sum(y[(i, b)] for b in buckets) == 1)
+        model.Add(sum(y[(i, b)] for b in buckets) <= 1)
+
+    if constraint_on_buckets is not None:
+        constraint_on_buckets = list(constraint_on_buckets)
+        for col in constraint_on_buckets:
+            if col not in df_minima.columns:
+                raise ValueError(
+                    f"Column '{col}' from constraint_on_bucket not found in df_minima"
+                )
+    else:
+        constraint_on_buckets = []
+
+    # ------------------------------------------------------------------
+    # Group constraint (generalized):
+    # rows with same values in constraint_cols must be assigned to buckets
+    # that share the same values for the columns in constraint_on_bucket.
+    #
+    # Example:
+    #   constraint_cols      = ["noun"]
+    #   constraint_on_bucket = ["split"]
+    # => all rows with same noun must have the same split (train/test),
+    #    but can differ in preposition, construction, etc.
+    # ------------------------------------------------------------------
+    if constraint_on_rows and constraint_on_buckets:
+        # Precompute a "bucket key" for each bucket:
+        # a tuple of the constraint_on_bucket column values.
+        bucket_key: Dict[int, tuple] = {
+            b: tuple(df_minima.loc[b, col] for col in constraint_on_buckets)
+            for b in buckets
+        }
+
+        # All distinct bucket keys
+        key_values = sorted(set(bucket_key.values()))
+
+        # t[i, key] = 1 if row i is assigned to some bucket whose bucket_key == key
+        t: Dict[tuple, cp_model.IntVar] = {}
+
+        for i in indices:
+            for key in key_values:
+                t[(i, key)] = model.NewBoolVar(f"t_{i}_{key}")
+                # t[i,key] == sum of y[i,b] over buckets with that key
+                model.Add(
+                    t[(i, key)]
+                    == sum(
+                        y[(i, b)]
+                        for b in buckets
+                        if bucket_key[b] == key
+                    )
+                )
+
+        # Now group rows by the row-side properties (constraint_cols)
+        groups = df.groupby(list(constraint_on_rows))
+
+        for _, group in groups:
+            idxs = list(group.index)
+            if len(idxs) <= 1:
+                continue  # nothing to tie
+
+            i0 = idxs[0]
+
+            # Enforce: for every bucket-key, t[i,key] == t[i0,key]
+            # => all rows in this group share the same bucket_key
+            for i in idxs[1:]:
+                for key in key_values:
+                    model.Add(t[(i, key)] == t[(i0, key)])
 
     # Minimum size constraints from df_minima[min_required_col]
     for b in buckets:
@@ -222,6 +303,7 @@ def assign_buckets(
     status = solver.Solve(model)
 
     if status not in (cp_model.FEASIBLE, cp_model.OPTIMAL):
+
         raise RuntimeError(f"No feasible solution: {solver.StatusName(status)}")
 
     if verbose:
@@ -233,12 +315,17 @@ def assign_buckets(
     for i in indices:
         assigned_b: Optional[int] = None
         for b in buckets:
+            # print(buckets)
+            # input()
             if solver.Value(y[(i, b)]) == 1:
                 assigned_b = b
                 break
 
         if assigned_b is None:
-            raise RuntimeError(f"No bucket assigned for row {i}")
+            # assigned_b=
+            sys.stderr.write(f"Row {i} (values {df.loc[i].to_dict()}) "
+                            "is not assigned to any bucket.")
+            # raise RuntimeError(f"No bucket assigned for row {i}")
 
         # Build human-readable bucket label from all bucket-defining columns
         parts = [str(df_minima.loc[assigned_b, col]) for col in bucket_cols]
@@ -275,8 +362,10 @@ if __name__ == "__main__":
     df_many = assign_buckets_multiple(
     df,
     df_minima,
+    constraint_on_rows = ["noun", "construction"],
+    constraint_on_buckets= ["split"],
     n_samples=5,
-    base_seed=42,      # or None if you don’t care about reproducibility
+    base_seed=42,
     )
 
     # df_out = assign_buckets(df, df_minima)
