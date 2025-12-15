@@ -6,6 +6,21 @@ import numpy as np
 from ortools.sat.python import cp_model
 
 
+def matches_bucket_value(row_value, bucket_value) -> bool:
+    """
+    row_value     = value in df (e.g. 'PNPN')
+    bucket_value  = value in df_minima (e.g. 'PNPN', '!PNPN', '*')
+    """
+    if bucket_value == "*":
+        return True  # wildcard: always matches
+
+    if isinstance(bucket_value, str) and bucket_value.startswith("!"):
+        forbidden = bucket_value[1:]
+        return row_value != forbidden
+
+    # Normal exact match
+    return row_value == bucket_value
+
 def assign_buckets_multiple(
     df: pd.DataFrame,
     df_minima: pd.DataFrame,
@@ -173,8 +188,12 @@ def assign_buckets(
         any_match = False
         for b in buckets:
             # Check if row i can belong to bucket b: all key_cols must match
+            # row_matches = all(
+            #     df.loc[i, col] == df_minima.loc[b, col] for col in key_cols
+            # )
             row_matches = all(
-                df.loc[i, col] == df_minima.loc[b, col] for col in key_cols
+                matches_bucket_value(df.loc[i, col], df_minima.loc[b, col])
+                for col in key_cols
             )
             if row_matches:
                 var = model.NewBoolVar(f"y_{i}_{b}")
@@ -345,19 +364,7 @@ if __name__ == "__main__":
 
     df = pd.read_csv(sys.argv[1], sep=";")
 
-    df_minima = pd.DataFrame(
-    {
-        "split": [
-            "train", "test",
-            "train", "test",
-            "train", "test",
-            "train", "test",
-        ],
-        "preposition": ["a", "a", "a", "a", "su", "su", "su", "su"],
-        "construction": ["no", "no", "yes", "yes", "no", "no", "yes", "yes"],
-        "min_required": [120, 30, 120, 30, 120, 30, 120, 30],
-    }
-    )
+    df_minima = pd.read_csv(sys.argv[3], sep=";")
 
     df_many = assign_buckets_multiple(
     df,
